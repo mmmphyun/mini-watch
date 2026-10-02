@@ -6,7 +6,7 @@
 
 ## 1. 디렉토리 구조 표준
 
-각 일차별 실습은 노션 페이지의 산출물을 참고하여 확인합니다.
+각 일차별 실습은 day00 형태의 디렉토리 내 존재하며, 하위 산출물은 강의 노션 페이지를 참고하여 확인합니다.
 
 예시: 4과목 1일차 - general/, monitor/, clients/, requirements.txt, README·Git 이력과 GitHub의 mini-watch 저장소, monitor/logs/http_events.jsonl
 예시 출처 (https://app.notion.com/p/Day-1-3b9ae3d1800c815db6c8e4747b254b76)
