@@ -179,13 +179,24 @@ docker compose -f compose-monitor.yaml exec monitor-api python create_user.py op
   3. **SQL 실행 (Query Engine)**: 스키마, 테이블, 권한, 트랜잭션 등 데이터 계층의 논리적 무결성 확인
   이 세 단계는 네트워크, 인증, 스키마 계층의 결함을 격리하여 진단하기 위해 명확히 구분되어야 합니다.
 
+### 5.4 Docker 설정 변경 PR 검토 및 병합 이력
+- **개선 목적**: PostgreSQL 데이터베이스 컨테이너 종료 시 트랜잭션 플러시 및 WAL 체크포인트 기록 시간을 확보하여 비정상 종료로 인한 데이터 손상을 방지하기 위해 Graceful Shutdown 유예 시간(`stop_grace_period: 30s`)을 명시적으로 추가.
+- **작업 브랜치**: `feature/docker-graceful-shutdown`
+- **변경 파일**: `compose-general.yaml`, `compose-monitor.yaml`
+- **커밋 식별자**: `d953325` (`refactor(docker): PostgreSQL DB 서비스에 정상 종료 유예 시간(stop_grace_period) 설정 추가`)
+- **Pull Request**: [#1](https://github.com/mmmphyun/mini-watch/pull/1) (병합 커밋: `b73bc11`)
+
 ---
 
 ## 6. Git 커밋 이력 및 변경 내용
 
-- `feat(docker): 일반 및 감시 서비스 2-Compose 분리 구성 및 격리/공유 네트워크 연동`
-  - 두 Compose 파일 명세 완성 (`compose-general.yaml`, `compose-monitor.yaml`)
-  - DB `healthcheck` 및 의존성 `service_healthy` 체인 구성
-  - Nginx 리버스 프록시 게이트웨이 및 호스트 공개 포트 분리 (`8081`, `8082`)
-  - 외부 공유망 `m5d1-events` 설정 및 DB 네트워크 격리 구현
-  - 세션 인증을 위한 `SECRET_KEY` 환경변수 설정 및 데이터 볼륨 영속화 보장
+1. `6024744`: `feat(docker): 일반 및 감시 서비스 2-Compose 분리 구성 및 격리·공유 네트워크 연동`
+   - 두 Compose 파일 명세 완성 (`compose-general.yaml`, `compose-monitor.yaml`)
+   - DB `healthcheck` 및 의존성 `service_healthy` 체인 구성
+   - Nginx 리버스 프록시 게이트웨이 및 호스트 공개 포트 분리 (`8081`, `8082`)
+   - 외부 공유망 `m5d1-events` 설정 및 DB 네트워크 격리 구현
+   - 세션 인증을 위한 `SECRET_KEY` 환경변수 설정 및 데이터 볼륨 영속화 보장
+2. `d953325`: `refactor(docker): PostgreSQL DB 서비스에 정상 종료 유예 시간(stop_grace_period) 설정 추가`
+   - 두 DB 서비스에 Graceful Shutdown 30초 유예 기간 설정
+3. `b73bc11`: `Merge pull request #1 from mmmphyun/feature/docker-graceful-shutdown`
+   - 작업 브랜치 검토 후 `main` 브랜치 병합 이력 반영
