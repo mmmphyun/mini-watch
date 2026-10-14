@@ -33,8 +33,8 @@ def sentry_test():
     error = api_access_error()
     if error:
         return error
-    # 오류 위치를 확인한 뒤 이 응답 부분을 수정한다.
-    result = 1 / 0
+    # 나눗셈 0 오류(1 / 0)를 정상 JSON 응답으로 수정 완료
+    result = "ok"
     return {'result': result}
 
 
