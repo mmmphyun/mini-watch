@@ -1,202 +1,121 @@
-# 미니프로젝트: 일반·감시 서비스 Docker Compose 분리 구성 및 격리 운영
+# 미니프로젝트: 일반·감시 서비스 클라우드 배포 및 오류 수집 운영
 
-본 문서는 일반 서비스(`m5d1-general`)와 감시 서비스(`m5d1-monitor`)를 독립된 두 개의 Docker Compose 스택으로 분리 구성하고, 내부 보안 격리망 및 외부 공유망(`m5d1-events`)을 통해 안전하게 상호작용하도록 구축한 실행 지침서입니다.
-
----
-
-## 1. 프로젝트 개요 및 변경 내역
-
-- **시작 코드 기준**: `mini-watch` `day06-start` 브랜치 소스 및 `day1-materials/project-starter` 템플릿
-- **완성 및 직접 작성한 구성 파일**:
-  - `compose-general.yaml`: 일반 서비스 스택 정의 (`general-db`, `general-api`, `general-gateway`)
-  - `compose-monitor.yaml`: 감시 서비스 스택 정의 (`monitor-db`, `monitor-api`, `monitor-web`, `monitor-gateway`)
-  - `gateways/general.conf`: 일반 Nginx Reverse Proxy 설정 (포트 8081 -> `general-api:5000`)
-  - `gateways/monitor.conf`: 감시 Nginx Reverse Proxy 설정 (포트 8082 -> `monitor-api:5000`, `monitor-web:3000`)
-  - `general/Dockerfile` & `monitor/backend/Dockerfile`: Python 3.13-slim 기반 Flask API 컨테이너 정의 (`0.0.0.0:5000`)
-  - `monitor/next-frontend/Dockerfile`: Node.js 24 기반 Next.js 프로덕션 빌드/실행 환경 구성 (`0.0.0.0:3000`)
-  - `general/sql/docker-init.sql` & `monitor/backend/sql/docker-init.sql`: 각 DB 컨테이너 최초 기동 시 자동 실행되는 테이블 및 초기 데이터 스크립트
+> [!IMPORTANT]
+> **배포 계획 및 상세 아키텍처 명세서**: 전체 배포 설정, Supabase 연동 명세, 프록시 라우터, Sentry 장애 분석 및 심화 과제에 대한 상세 내용은 [deployment-plan.md](file:///c:/work/mini-watch-standalone/deployment-plan.md)를 참조하십시오.
 
 ---
 
-## 2. 서비스 아키텍처 및 네트워크 토폴로지
+## 1. 프로젝트 개요 및 배포 상태
 
-### 2.1 아키텍처 다이어그램
+본 프로젝트는 기존 일반 서비스(`general`), 감시 백엔드(`monitor/backend`), 감시 프론트엔드(`monitor/next-frontend`)를 클라우드 환경(Render Docker Web Service)에 배포하고, 외부 관리형 데이터베이스(Supabase PostgreSQL) 및 오류 추적 시스템(Sentry)을 연동하여 무중단 운영 환경을 구축한 프로젝트입니다.
 
-```
-[ 호스트 PC 브라우저 / 외부 ]
-       │ :8081                     │ :8082
-       ▼                           ▼
-┌──────────────────┐        ┌──────────────────┐
-│ general-gateway  │        │ monitor-gateway  │
-└────────┬─────────┘        └────┬─────────┬───┘
-         │ (front-net)           │         │ (front-net)
-         ▼                       ▼         ▼
-┌──────────────────┐        ┌─────────┐ ┌───────────────┐
-│   general-api    │        │monitor- │ │  monitor-web  │
-│  (Flask :5000)   │        │   api   │ │(Next.js :3000)│
-└─────┬──────┬─────┘        └────┬────┴─└───┬───────────┘
-      │      │                   │          │
-      │      │ (m5d1-events)     │          │
-      │      └───────────────────┤          │
-      │                          │          │
-      ▼ (data-net)               ▼ (data-net)
-┌──────────────────┐        ┌──────────────────┐
-│    general-db    │        │    monitor-db    │
-│ (PostgreSQL:5432)│        │ (PostgreSQL:5432)│
-└──────────────────┘        └──────────────────┘
-```
+- **작업 및 배포 브랜치**: `day2-deploy`
+- **시작 코드 기준**: `day06-submit` (Day1 일반·감시 2-Compose 완성본) 및 `day07-cloud-materials`(`starter`) 지원 파일
+- **세 앱의 배포 설정 및 진행 상태**:
 
-### 2.2 서비스별 네트워크 참여 및 공개 포트
+| 앱 구분 | 서비스명 | Root Directory | Dockerfile Path | Health Check Path | 런타임 서버 | 배포 상태 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **일반 앱** | `mini-general` | `general` | `./Dockerfile` | `/health` | Waitress WSGI (`0.0.0.0:$PORT`) | 미배포 (배포 구성 완료 / 로컬 검증 완료) |
+| **감시 API** | `mini-monitor` | `monitor/backend` | `./Dockerfile` | `/health` | Waitress WSGI (`0.0.0.0:$PORT`) | 미배포 (배포 구성 완료 / 로컬 검증 완료) |
+| **감시 화면** | `mini-web` | `monitor/next-frontend` | `./Dockerfile` | `/` | Next.js Node.js Server (`:3000`) | 미배포 (배포 구성 완료 / 로컬 검증 완료) |
 
-| 서비스명 | 프로젝트명 | 참여 네트워크 | 호스트 공개 포트 | 역할 설명 |
-| :--- | :--- | :--- | :--- | :--- |
-| `general-gateway` | `m5d1-general` | `general-front-net` | `8081:80` | 일반 서비스 인그레스 프록시 |
-| `general-api` | `m5d1-general` | `general-front-net`, `general-data-net`, `events-net` (`m5d1-events`) | 비공개 (내부 :5000) | 일반 비즈니스 로직 및 이벤트 송신 |
-| `general-db` | `m5d1-general` | `general-data-net` | 비공개 (내부 :5432) | 일반 서비스 전용 PostgreSQL DB |
-| `monitor-gateway` | `m5d1-monitor` | `monitor-front-net` | `8082:80` | 감시 서비스 인그레스 프록시 |
-| `monitor-api` | `m5d1-monitor` | `monitor-front-net`, `monitor-data-net`, `events-net` (`m5d1-events`) | 비공개 (내부 :5000) | 감시 백엔드, 이벤트 수신, 메모 API |
-| `monitor-web` | `m5d1-monitor` | `monitor-front-net` | 비공개 (내부 :3000) | 감시 Next.js 프론트엔드 대시보드 |
-| `monitor-db` | `m5d1-monitor` | `monitor-data-net` | 비공개 (내부 :5432) | 감시 서비스 전용 PostgreSQL DB |
-
-### 2.3 네트워크 별칭(내부 네트워크) vs 외부 공유망(`external: true`) 차이
-
-- **Compose 내부 네트워크 (`general-front-net` 등)**:
-  - Compose 파일 단위로 기본 네임스페이스 격리가 적용됩니다 (예: `m5d1-general_general-front-net`).
-  - 동일한 네트워크 이름을 두 Compose 파일에 정의하더라도 별개의 브리지 네트워크가 생성되므로 스택 간 통신 및 DNS 해석이 차단됩니다.
-- **외부 공유망 (`m5d1-events`, `external: true`)**:
-  - Docker 엔진 레벨에서 사전에 생성된 단일 L2 가상 브리지 네트워크(`m5d1-events`)에 양쪽 스택의 컨테이너를 직접 바인딩합니다.
-  - 이를 통해 `general-api`와 `monitor-api` 컨테이너만 동일 서브넷에 배치되어 Docker 내장 DNS(`127.0.0.11`)를 통해 상대방 컨테이너 이름(`http://monitor-api:5000/api/events`)으로 통신할 수 있습니다.
-  - 두 DB 컨테이너(`general-db`, `monitor-db`)는 공유망에서 철저히 배제되어 외부/타 스택으로부터의 침해를 원천 차단합니다.
+> **로컬 실행과 클라우드 배포의 구분**:
+> - 기존 `compose-general.yaml`, `compose-monitor.yaml`, `gateways/` 설정은 로컬 개발 및 격리 컨테이너 테스트용으로 그대로 유지됩니다.
+> - 클라우드 배포 환경(Render)에서는 Nginx 게이트웨이를 거치지 않고 각 앱의 `Dockerfile`을 통해 독립적인 Docker Web Service로 직접 빌드·서빙됩니다.
 
 ---
 
-## 3. 실행 및 검증 가이드 (Step-by-Step)
+## 2. 직접 변경한 파일 및 변경 목적
 
-### 3.1 사전 작업: 공유망 생성
-```powershell
-docker network create m5d1-events
-```
-
-### 3.2 이미지 빌드 및 감시 스택 기동
-감시 API가 먼저 기동되어야 일반 서비스의 로그인 이벤트 수신 준비가 완료되므로, 감시 스택을 우선 실행합니다.
-
-```powershell
-# 감시 스택 빌드 및 백그라운드 기동
-docker compose -f compose-monitor.yaml up -d --build
-
-# 감시 API 헬스 확인 (HTTP 200 반환 대기)
-curl -i http://localhost:8082/api/auth/me
-```
-
-### 3.3 일반 스택 기동
-```powershell
-# 일반 스택 빌드 및 백그라운드 기동
-docker compose -f compose-general.yaml up -d --build
-```
-
-### 3.4 실습용 계정 생성
-각 API 컨테이너에 접속하여 실습용 기본 계정을 프로비저닝합니다.
-```powershell
-# 일반 서비스 계정 생성 (student / Learn123!)
-docker compose -f compose-general.yaml exec general-api python create_user.py student "Learn123!"
-
-# 감시 서비스 계정 생성 (operator / Learn123!)
-docker compose -f compose-monitor.yaml exec monitor-api python create_user.py operator "Learn123!"
-```
-
-### 3.5 점검 및 상태 검증 명령어 명세
-
-| 검증 단계 | 명령어 | 확인 목적 및 기대 결과 |
-| :--- | :--- | :--- |
-| **설정 문법 검증** | `docker compose -f compose-general.yaml config --quiet`<br>`docker compose -f compose-monitor.yaml config --quiet` | 각 YAML 파일의 문법적 오류 및 네트워크/볼륨 선언 정합성 검증 (출력 없음: 정상) |
-| **컨테이너 실행 상태** | `docker compose -f compose-general.yaml ps`<br>`docker compose -f compose-monitor.yaml ps` | DB `healthy` 상태 여부, API/Gateway/Web의 `Up` 상태 및 포트 바인딩 확인 |
-| **공유망 참여 검증** | `docker network inspect m5d1-events` | `m5d1-general-general-api-1`과 `m5d1-monitor-monitor-api-1` 두 컨테이너만 참여하고 DB는 제외되었는지 확인 |
-| **컨테이너 간 이름 조회 (DNS)** | `docker compose -f compose-general.yaml exec general-api getent hosts monitor-api` | `general-api` 내부에서 `monitor-api`의 가상 IP 주소 해석 가능 여부 확인 |
-| **앱 계층 응답 확인** | `curl -i http://localhost:8082/api/auth/me` | 네트워크 DNS 해석을 넘어 HTTP 웹 서버, 라우터, DB 세션 계층이 정상 동작하는지 확인 |
-
-> **[이름 조회 vs 실제 앱 요청의 차이점]**
-> - `getent hosts`: OS 및 Docker 데몬의 내장 DNS Resolver(L3/L4 수준)를 통해 도메인 이름이 IP로 변환되는지만 검증합니다.
-> - HTTP API 요청: L7 애플리케이션 계층까지 패킷이 도달하여 Nginx 게이트웨이 리버스 프록시, Flask 라우터, PostgreSQL 세션/인증 메커니즘이 모두 정상 구동 중인지를 종합적으로 검증합니다.
+| 파일 경로 | 변경 목적 및 적용 내용 |
+| :--- | :--- |
+| [general/Dockerfile](file:///c:/work/mini-watch-standalone/general/Dockerfile) | Werkzeug 개발 서버 대신 Waitress WSGI 프로덕션 서빙 명령(`0.0.0.0:$PORT`) 적용 |
+| [general/requirements.txt](file:///c:/work/mini-watch-standalone/general/requirements.txt) | 프로덕션 WSGI 서버(`waitress==3.0.2`) 및 Sentry SDK(`sentry-sdk[flask]==2.72.0`) 의존성 추가 |
+| [general/db.py](file:///c:/work/mini-watch-standalone/general/db.py) | Supabase Session pooler 대응 6대 환경변수 매핑(`DB_SSLMODE=require`, timeout 10초) |
+| [general/sql/deploy.sql](file:///c:/work/mini-watch-standalone/general/sql/deploy.sql) | 일반 DB(`users`, `posts`) 무중단 배포 DDL 작성 (`IF NOT EXISTS`, 시퀀스 보존) |
+| [general/create_user.py](file:///c:/work/mini-watch-standalone/general/create_user.py) | 12자 이상 비밀번호 입력을 위한 대화형 프롬프트 및 PBKDF2 해시 저장 로직 적용 |
+| [general/auth_helpers.py](file:///c:/work/mini-watch-standalone/general/auth_helpers.py) | 32자 이상 `SECRET_KEY` 검증 및 `SESSION_COOKIE_SECURE` 환경변수 연동 |
+| [general/request_logging.py](file:///c:/work/mini-watch-standalone/general/request_logging.py) | 감시 서비스 통신 시 `X-Event-Token` 헤더 전송, `/health` 트래픽 수집 제외 |
+| [general/observability.py](file:///c:/work/mini-watch-standalone/general/observability.py) | Sentry SDK 초기화 및 개인정보/비밀값 필터링 훅(`before_send`) 구성 |
+| [general/app.py](file:///c:/work/mini-watch-standalone/general/app.py) | `/health` 엔드포인트 연동 및 `/api/sentry-test` 0 나누기 오류(`ZeroDivisionError`) 정상 응답 수정 |
+| [general/.env.example](file:///c:/work/mini-watch-standalone/general/.env.example) | Supabase 5432, postgres, SSL require 및 환경변수 템플릿 표준화 (비밀값 배제) |
+| [monitor/backend/Dockerfile](file:///c:/work/mini-watch-standalone/monitor/backend/Dockerfile) | 감시 백엔드 Waitress WSGI 프로덕션 서빙 명령(`0.0.0.0:$PORT`) 적용 |
+| [monitor/backend/requirements.txt](file:///c:/work/mini-watch-standalone/monitor/backend/requirements.txt) | 프로덕션 WSGI 서버(`waitress`) 및 Sentry SDK(`sentry-sdk[flask]`) 의존성 추가 |
+| [monitor/backend/db.py](file:///c:/work/mini-watch-standalone/monitor/backend/db.py) | Supabase Session pooler 대응 6대 환경변수 매핑(`DB_SSLMODE=require`) |
+| [monitor/backend/sql/deploy.sql](file:///c:/work/mini-watch-standalone/monitor/backend/sql/deploy.sql) | 감시 DB(`users`, `http_events`, `notes`) 무중단 배포 DDL 작성 (`IF NOT EXISTS`) |
+| [monitor/backend/create_user.py](file:///c:/work/mini-watch-standalone/monitor/backend/create_user.py) | 대화형 계정 생성 스크립트 적용 |
+| [monitor/backend/auth_helpers.py](file:///c:/work/mini-watch-standalone/monitor/backend/auth_helpers.py) | `SECRET_KEY` 32자 검증 및 `SESSION_COOKIE_SECURE` 환경변수 연동 |
+| [monitor/backend/routes/events.py](file:///c:/work/mini-watch-standalone/monitor/backend/routes/events.py) | `/health` 엔드포인트 유지, `X-Event-Token` HMAC 검증 및 로그인 성공/실패 이벤트 분류 |
+| [monitor/backend/observability.py](file:///c:/work/mini-watch-standalone/monitor/backend/observability.py) | 감시 백엔드 Sentry SDK 초기화 및 민감정보 제외 파이프라인 구성 |
+| [monitor/backend/app.py](file:///c:/work/mini-watch-standalone/monitor/backend/app.py) | Sentry 초기화 연동 및 `/api/sentry-test` 엔드포인트 구성 |
+| [monitor/backend/.env.example](file:///c:/work/mini-watch-standalone/monitor/backend/.env.example) | 감시 DB 및 감시 서비스 환경변수 템플릿 표준화 (비밀값 배제) |
+| [monitor/next-frontend/Dockerfile](file:///c:/work/mini-watch-standalone/monitor/next-frontend/Dockerfile) | Node.js 24 기반 프로덕션 빌드/실행 환경 구성 (`npm ci` -> `build` -> `start`) |
+| [monitor/next-frontend/app/api/[...path]/route.js](file:///c:/work/mini-watch-standalone/monitor/next-frontend/app/api/[...path]/route.js) | Next.js 서버 Route Handler 프록시 구성 (`Cookie`, `X-CSRF-Token`, `Set-Cookie` 중계) |
+| [monitor/next-frontend/.env.example](file:///c:/work/mini-watch-standalone/monitor/next-frontend/.env.example) | Next.js 서버용 `MONITOR_API_URL` 템플릿 명세 |
+| [monitor/next-frontend/.gitignore](file:///c:/work/mini-watch-standalone/monitor/next-frontend/.gitignore) | `.env.example` 커밋 허용 규칙(`!.env.example`) 명시 |
+| [deployment-plan.md](file:///c:/work/mini-watch-standalone/deployment-plan.md) | 세 앱의 클라우드 배포 계획서, 아키텍처 다이어그램 및 문제 해결 가이드 작성 |
 
 ---
 
-## 4. 시나리오 동작 검증 절차
+## 3. 데이터베이스 대응 및 계정 준비 방법
 
-1. **일반 서비스 로그인 실패 및 성공 테스트**:
-   - 브라우저에서 `http://localhost:8081/login` 접속.
-   - `student` 계정에 잘못된 비밀번호를 입력하여 401 오류 발생 유발.
-   - 정상 비밀번호(`Learn123!`)로 로그인하여 게시글 화면 정상 진입 (200 확인).
-2. **감시 서비스 기록 및 메모 등록**:
-   - `http://localhost:8082` 접속 후 `operator / Learn123!`로 로그인.
-   - 요청 기록 탭에서 `login_failure` (401) 및 `login_success` (200) 이벤트가 수신되었는지 확인.
-   - 메모 탭에서 제목 `Docker 점검`, 내용 `로그인 실패와 성공을 확인했다` 입력 및 등록.
-3. **데이터 영속성 검증 (Graceful Down & Restart)**:
-   - 볼륨 보존 종료 명령 실행:
-     ```powershell
-     docker compose -f compose-general.yaml down
-     docker compose -f compose-monitor.yaml down
-     ```
-     *(주의: `-v` 플래그는 named volume을 파괴하므로 사용 금지)*
-   - 감시 -> 일반 순서로 재실행:
-     ```powershell
-     docker compose -f compose-monitor.yaml up -d
-     docker compose -f compose-general.yaml up -d
-     ```
-   - 재접속 후 기존 생성된 메모와 로그인 기록이 영구 보존되어 유지되는지 확인.
+- **일반 DB**: Supabase 독립 프로젝트 A (`general/sql/deploy.sql` 적용 -> `users`, `posts`)
+- **감시 DB**: Supabase 독립 프로젝트 B (`monitor/backend/sql/deploy.sql` 적용 -> `users`, `http_events`, `notes`)
+- **공통 연결 규격**:
+  - `DB_HOST`: Supabase Session pooler 주소
+  - `DB_PORT`: `5432`
+  - `DB_NAME`: `postgres`
+  - `DB_USER`: `postgres.[PROJECT-REF]`
+  - `DB_SSLMODE`: `require`
+- **계정 프로비저닝 (로컬 가상환경)**:
+  각 서비스 디렉터리(`general/` 또는 `monitor/backend/`)에서 `.venv` 가상환경을 활성화한 후 `python create_user.py`를 실행하여 12자 이상의 안전한 비밀번호로 사용자 계정을 생성합니다.
 
 ---
 
-## 5. 심화 미션 해설
+## 4. 서비스 간 요청 흐름 및 주소 체계
 
-### 5.1 공유망 분리 및 복구 영향 분석
-- **분리 명령**:
-  ```powershell
-  docker network disconnect m5d1-events m5d1-general-general-api-1
-  ```
-  - **영향**: `general-api` 컨테이너의 네트워크 네임스페이스에서 `m5d1-events` 인터페이스가 제거됩니다.
-  - **결과**: `getent hosts monitor-api` 실행 시 DNS 해석 불가(`Host name lookup failure`)가 발생하며, 일반 서비스에서 발생하는 로그인 및 HTTP 요청 기록 전송 시 `requests.RequestException`이 발생하여 경고 로그가 기록되고 감시 서버로의 이벤트 전달이 전면 중단됩니다.
-- **복구 명령**:
-  ```powershell
-  docker network connect m5d1-events m5d1-general-general-api-1
-  ```
-  - **결과**: `general-api`가 공유망에 재진입하여 정상적으로 `monitor-api`의 IP를 조회하고 기록 전송이 재개됩니다.
-
-### 5.2 단순 재시작(`restart`)과 재빌드(`rebuild`)의 차이
-- **원인 분석**:
-  - `general/Dockerfile`과 `monitor/backend/Dockerfile`은 소스 코드를 `COPY . .` 명령을 통해 이미지 파일시스템 레이어에 정적으로 굽는 방식을 사용합니다.
-  - `compose-*.yaml`에 호스트 경로를 컨테이너 내부로 바인딩하는 바인드 마운트(`volumes: - ./general:/app`)가 선언되어 있지 않습니다.
-- **차이점**:
-  - `docker compose restart`: 기존 컨테이너 프로세스만 재기동하므로 이미지 레이어에 구워진 과거 코드가 그대로 유지되어 소스 변경사항이 반영되지 않습니다.
-  - `docker compose up -d --build`: 변경된 소스 코드를 바탕으로 Dockerfile의 빌드 레이어를 새로 생성한 뒤 컨테이너를 재생성하므로 코드 변경사항이 온전히 반영됩니다.
-
-### 5.3 DB 격리망 구성과 다계층 검증의 필요성
-- **조회 차이**:
-  - `general-api`에서 `general-db` 조회: 동일 `general-data-net`에 속해 있으므로 정상적으로 IP(예: `172.26.0.2`)가 조회됩니다.
-  - `general-api`에서 `monitor-db` 조회: `monitor-db`는 `monitor-data-net`에만 속해 있고 공유망 `m5d1-events`에 참여하지 않으므로 Docker DNS에서 이름을 찾지 못하고 조회가 실패합니다.
-- **확인 단계 구분 이유**:
-  1. **이름 조회 (DNS)**: L3/L4 네트워크 연결성 및 라우팅 가능 여부 확인
-  2. **DB 인증 (Handshake & Auth)**: 포트 개방 여부, 계정명, 비밀번호, 접근 허용 정책(`pg_hba.conf`)의 일치 확인
-  3. **SQL 실행 (Query Engine)**: 스키마, 테이블, 권한, 트랜잭션 등 데이터 계층의 논리적 무결성 확인
-  이 세 단계는 네트워크, 인증, 스키마 계층의 결함을 격리하여 진단하기 위해 명확히 구분되어야 합니다.
-
-### 5.4 Docker 설정 변경 PR 검토 및 병합 이력
-- **개선 목적**: PostgreSQL 데이터베이스 컨테이너 종료 시 트랜잭션 플러시 및 WAL 체크포인트 기록 시간을 확보하여 비정상 종료로 인한 데이터 손상을 방지하기 위해 Graceful Shutdown 유예 시간(`stop_grace_period: 30s`)을 명시적으로 추가.
-- **작업 브랜치**: `feature/docker-graceful-shutdown`
-- **변경 파일**: `compose-general.yaml`, `compose-monitor.yaml`
-- **커밋 식별자**: `d953325` (`refactor(docker): PostgreSQL DB 서비스에 정상 종료 유예 시간(stop_grace_period) 설정 추가`)
-- **Pull Request**: [#1](https://github.com/mmmphyun/mini-watch/pull/1) (병합 커밋: `b73bc11`)
+1. **감시 화면 요청 흐름**:
+   - 브라우저(`Dashboard.jsx`) → Next.js 서버 동일 오리진(`/api/...`) 요청
+   - Route Handler(`app/api/[...path]/route.js`)가 `MONITOR_API_URL`을 통해 감시 Flask(`https://<MONITOR_HOST>/api/...`)로 프록시 포워딩
+   - `Cookie`, `X-CSRF-Token` 헤더 전달 및 응답의 `Set-Cookie`를 브라우저로 릴레이
+   - 감시 Flask가 Supabase 감시 DB를 조회/갱신 후 응답 반환
+2. **일반 로그 파이프라인 흐름**:
+   - 사용자 웹 요청 처리 후 일반 Flask의 `request_logging.py`가 백그라운드에서 감시 Flask의 `MONITOR_URL`(`https://<MONITOR_HOST>/api/events`)로 POST 요청 전송
+   - `X-Event-Token` 헤더에 `EVENT_TOKEN`을 실어 전송
+   - 감시 Flask의 `routes/events.py`에서 토큰 일치 여부를 HMAC 비교로 검증한 뒤, `login_success`(200), `login_failure`(401), `http_request`로 분류하여 감시 DB `http_events`에 영구 저장
 
 ---
 
-## 6. Git 커밋 이력 및 변경 내용
+## 5. 실습 오류 수정 내역 및 배포 절차
 
-1. `6024744`: `feat(docker): 일반 및 감시 서비스 2-Compose 분리 구성 및 격리·공유 네트워크 연동`
-   - 두 Compose 파일 명세 완성 (`compose-general.yaml`, `compose-monitor.yaml`)
-   - DB `healthcheck` 및 의존성 `service_healthy` 체인 구성
-   - Nginx 리버스 프록시 게이트웨이 및 호스트 공개 포트 분리 (`8081`, `8082`)
-   - 외부 공유망 `m5d1-events` 설정 및 DB 네트워크 격리 구현
-   - 세션 인증을 위한 `SECRET_KEY` 환경변수 설정 및 데이터 볼륨 영속화 보장
-2. `d953325`: `refactor(docker): PostgreSQL DB 서비스에 정상 종료 유예 시간(stop_grace_period) 설정 추가`
-   - 두 DB 서비스에 Graceful Shutdown 30초 유예 기간 설정
-3. `b73bc11`: `Merge pull request #1 from mmmphyun/feature/docker-graceful-shutdown`
-   - 작업 브랜치 검토 후 `main` 브랜치 병합 이력 반영
+### 5.1 오류 수정 명세
+- **수정 파일**: `general/app.py`
+- **수정 함수**: `sentry_test()`
+- **오류 원인**: `result = 1 / 0` 실행으로 인한 무조건적인 `ZeroDivisionError` 예외 발생 (HTTP 500 유발)
+- **수정 내용**: 0 나누기 연산을 제거하고 `result = "ok"` 정상 JSON 응답(`{'result': result}`)을 반환하도록 수정함.
+- **오류 재현 및 수정 커밋**:
+  - 오류 재현 커밋: `974208e` (`feat(general): 실습 오류 재현을 위한 /api/sentry-test 엔드포인트 및 헬스체크 연동`)
+  - 오류 수정 커밋: `f29ad66` (`fix(general): /api/sentry-test 나눗셈 오류 수정 및 정상 응답 처리`)
+
+### 5.2 코드 수정 및 배포 확인 표준 절차
+1. 로컬 환경에서 코드 수정 및 테스트 실행
+2. Git 커밋 생성 및 원격 브랜치(`day2-deploy`)로 푸시
+3. Render 대시보드에서 해당 커밋의 빌드 로그 및 롤링 배포 성공 확인
+4. `/health` 헬스체크 엔드포인트를 통해 서버 프로세스 정상 기동 확인
+5. 실제 비즈니스 기능(로그인, 게시글 등록, 감시 이벤트 수신) 정상 동작 확인
+6. 실습 오류 점검 시 사용한 `ENABLE_SENTRY_TEST` 플래그는 점검 완료 후 반드시 `false`로 재설정하고 배포 커밋 갱신
+
+---
+
+## 6. 마이크로 커밋 이력 요약
+
+본 작업은 `atomic-commits` 원칙에 따라 1-Task 1-Commit 단위로 분해되어 실행되었습니다:
+
+1. `fef50c6` - `feat(deploy): 일반 및 감시 Flask Docker 배포 및 Waitress 런타임 설정`
+2. `56d76a0` - `feat(deploy): 감시 Next.js Docker 배포 설정 및 API 프록시 라우터 구성`
+3. `25d6c08` - `feat(db): Supabase Session pooler 연동 및 무중단 배포 DDL 스크립트 분리`
+4. `20c62bb` - `feat(auth): 사용자 생성 스크립트 대화형 전환 및 세션 쿠키 보안 강화`
+5. `76eca9b` - `feat(pipeline): 일반-감시 간 이벤트 전송 토큰 인증 및 .env.example 표준화`
+6. `7f061a8` - `feat(observability): Sentry SDK 초기화 및 민감정보 마스킹 파이프라인 연동`
+7. `974208e` - `feat(general): 실습 오류 재현을 위한 /api/sentry-test 엔드포인트 및 헬스체크 연동`
+8. `f29ad66` - `fix(general): /api/sentry-test 나눗셈 오류 수정 및 정상 응답 처리`
